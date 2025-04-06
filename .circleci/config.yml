@@ -1,13 +1,13 @@
 version: 2.1
 
-# Define executors (Linux-based)
+# Define executors
 executors:
   dotnet:
     docker:
-      - image: mcr.microsoft.com/dotnet/sdk:6.0  # Ubuntu-based with .NET 6.0
+      - image: mcr.microsoft.com/dotnet/sdk:6.0  # Linux-based .NET SDK
     working_directory: ~/repo
 
-  docker:
+  docker-executor:
     docker:
       - image: docker:20.10.7  # For Docker commands
     working_directory: ~/repo
@@ -17,18 +17,14 @@ jobs:
   checkout-and-build:
     executor: dotnet
     steps:
-      - checkout  # Pulls code from GitHub
+      - checkout  # Pull code from GitHub
       - run:
           name: Restore Dependencies
-          command: |
-            cd GenerateQR/GenerateQR_v3/GenerateQR
-            dotnet restore
+          command: dotnet restore
       - run:
           name: Build Project
-          command: |
-            cd GenerateQR/GenerateQR_v3/GenerateQR
-            dotnet build --configuration Release
-      - persist_to_workspace:  # Save build output for later jobs
+          command: dotnet build --configuration Release
+      - persist_to_workspace:  # Save for later jobs
           root: ~/repo
           paths:
             - .
@@ -42,26 +38,26 @@ jobs:
           name: Install Dependency-Check
           command: |
             apt-get update && apt-get install -y curl unzip
-            curl -L https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.9/dependency-check-9.0.9-release.zip -o dependency-check.zip
-            unzip dependency-check.zip -d /usr/local/
+            curl -L https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.9/dependency-check-9.0.9-release.zip -o dc.zip
+            unzip dc.zip -d /usr/local/
             chmod +x /usr/local/dependency-check/bin/dependency-check.sh
       - run:
           name: Run Dependency-Check
           command: |
             /usr/local/dependency-check/bin/dependency-check.sh \
-              --project "QR-code" \
+              --project "Assignment3" \
               --scan . \
-              --format JSON \
               --format HTML \
-              --out dependency-check-report \
+              --format JSON \
+              --out reports/dependency-check \
               --nvdApiKey "$NVD_API_KEY"
-      - store_artifacts:  # Store reports for download
-          path: dependency-check-report
-          destination: dependency-check-report
+      - store_artifacts:
+          path: reports/dependency-check
+          destination: dependency-check-reports
       - persist_to_workspace:
           root: ~/repo
           paths:
-            - dependency-check-report
+            - reports
 
   sonar-analysis:
     executor: dotnet
@@ -74,17 +70,16 @@ jobs:
       - run:
           name: Run SonarQube Analysis
           command: |
-            cd GenerateQR/GenerateQR_v3/GenerateQR
-            export PATH="$PATH:/root/.dotnet/tools"  # Ensure sonarscanner is in PATH
+            export PATH="$PATH:/root/.dotnet/tools"
             dotnet sonarscanner begin \
-              /k:"QR-code" \
-              /d:sonar.host.url="http://localhost:9000" \
+              /k:"assignment_3" \
+              /d:sonar.host.url="$SONARQUBE_URL" \
               /d:sonar.login="$SONARQUBE_TOKEN"
             dotnet build --configuration Release
             dotnet sonarscanner end /d:sonar.login="$SONARQUBE_TOKEN"
       - store_artifacts:
-          path: ~/repo/GenerateQR/GenerateQR_v3/GenerateQR/.sonarqube
-          destination: sonar-report
+          path: .sonarqube
+          destination: sonar-reports
 
   unit-tests:
     executor: dotnet
@@ -93,30 +88,27 @@ jobs:
           at: ~/repo
       - run:
           name: Run Unit Tests
-          command: |
-            cd GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests
-            dotnet test --logger "trx" --results-directory TestResults
-      - store_test_results:  # For CircleCI test summary
-          path: GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests/TestResults
+          command: dotnet test --logger "trx" --results-directory TestResults
+      - store_test_results:
+          path: TestResults
       - store_artifacts:
-          path: GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests/TestResults
+          path: TestResults
           destination: test-results
 
   build-and-push-docker:
-    executor: docker
+    executor: docker-executor
     steps:
       - checkout
-      - setup_remote_docker:  # Enable Docker commands
+      - setup_remote_docker:
           version: 20.10.7
       - run:
           name: Build Docker Image
-          command: |
-            docker build -t "$DOCKERHUB_USER/qr-code:latest" .
+          command: docker build -t "$DOCKERHUB_USER/assignment3:latest" .
       - run:
           name: Push to Docker Hub
           command: |
             echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin
-            docker push "$DOCKERHUB_USER/qr-code:latest"
+            docker push "$DOCKERHUB_USER/assignment3:latest"
 
   notify:
     executor: dotnet
@@ -132,13 +124,13 @@ jobs:
               -d '{
                 "personalizations": [{"to": [{"email": "athawerani@gmail.com"}]}],
                 "from": {"email": "no-reply@circleci.com"},
-                "subject": "CircleCI Build Report - QR-code",
+                "subject": "Assignment 3 Build Report",
                 "content": [
-                  {"type": "text/plain", "value": "Build completed. Check artifacts for Dependency-Check, SonarQube, and Unit Test reports: https://circleci.com/gh/aathawerani/Utilitites/${CIRCLE_BUILD_NUM}"}
+                  {"type": "text/plain", "value": "Build completed. Reports: https://circleci.com/gh/aathawerani/assignment_3/${CIRCLE_BUILD_NUM}"}
                 ]
               }'
 
-# Define workflow
+# Workflow
 workflows:
   build-test-deploy:
     jobs:
