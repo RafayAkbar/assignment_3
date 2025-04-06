@@ -1,0 +1,164 @@
+version: 2.1
+
+# Define executors (Linux-based)
+executors:
+  dotnet:
+    docker:
+      - image: mcr.microsoft.com/dotnet/sdk:6.0  # Ubuntu-based with .NET 6.0
+    working_directory: ~/repo
+
+  docker:
+    docker:
+      - image: docker:20.10.7  # For Docker commands
+    working_directory: ~/repo
+
+# Define jobs
+jobs:
+  checkout-and-build:
+    executor: dotnet
+    steps:
+      - checkout  # Pulls code from GitHub
+      - run:
+          name: Restore Dependencies
+          command: |
+            cd GenerateQR/GenerateQR_v3/GenerateQR
+            dotnet restore
+      - run:
+          name: Build Project
+          command: |
+            cd GenerateQR/GenerateQR_v3/GenerateQR
+            dotnet build --configuration Release
+      - persist_to_workspace:  # Save build output for later jobs
+          root: ~/repo
+          paths:
+            - .
+
+  dependency-check:
+    executor: dotnet
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run:
+          name: Install Dependency-Check
+          command: |
+            apt-get update && apt-get install -y curl unzip
+            curl -L https://github.com/jeremylong/DependencyCheck/releases/download/v9.0.9/dependency-check-9.0.9-release.zip -o dependency-check.zip
+            unzip dependency-check.zip -d /usr/local/
+            chmod +x /usr/local/dependency-check/bin/dependency-check.sh
+      - run:
+          name: Run Dependency-Check
+          command: |
+            /usr/local/dependency-check/bin/dependency-check.sh \
+              --project "QR-code" \
+              --scan . \
+              --format JSON \
+              --format HTML \
+              --out dependency-check-report \
+              --nvdApiKey "$NVD_API_KEY"
+      - store_artifacts:  # Store reports for download
+          path: dependency-check-report
+          destination: dependency-check-report
+      - persist_to_workspace:
+          root: ~/repo
+          paths:
+            - dependency-check-report
+
+  sonar-analysis:
+    executor: dotnet
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run:
+          name: Install SonarScanner
+          command: dotnet tool install --global dotnet-sonarscanner
+      - run:
+          name: Run SonarQube Analysis
+          command: |
+            cd GenerateQR/GenerateQR_v3/GenerateQR
+            export PATH="$PATH:/root/.dotnet/tools"  # Ensure sonarscanner is in PATH
+            dotnet sonarscanner begin \
+              /k:"QR-code" \
+              /d:sonar.host.url="http://localhost:9000" \
+              /d:sonar.login="$SONARQUBE_TOKEN"
+            dotnet build --configuration Release
+            dotnet sonarscanner end /d:sonar.login="$SONARQUBE_TOKEN"
+      - store_artifacts:
+          path: ~/repo/GenerateQR/GenerateQR_v3/GenerateQR/.sonarqube
+          destination: sonar-report
+
+  unit-tests:
+    executor: dotnet
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run:
+          name: Run Unit Tests
+          command: |
+            cd GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests
+            dotnet test --logger "trx" --results-directory TestResults
+      - store_test_results:  # For CircleCI test summary
+          path: GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests/TestResults
+      - store_artifacts:
+          path: GenerateQR/GenerateQR_v3/GenerateQR/GenerateQR.Tests/TestResults
+          destination: test-results
+
+  build-and-push-docker:
+    executor: docker
+    steps:
+      - checkout
+      - setup_remote_docker:  # Enable Docker commands
+          version: 20.10.7
+      - run:
+          name: Build Docker Image
+          command: |
+            docker build -t "$DOCKERHUB_USER/qr-code:latest" .
+      - run:
+          name: Push to Docker Hub
+          command: |
+            echo "$DOCKERHUB_PASS" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            docker push "$DOCKERHUB_USER/qr-code:latest"
+
+  notify:
+    executor: dotnet
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run:
+          name: Send Email Notification
+          command: |
+            curl -X POST "https://api.sendgrid.com/v3/mail/send" \
+              -H "Authorization: Bearer $SENDGRID_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "personalizations": [{"to": [{"email": "athawerani@gmail.com"}]}],
+                "from": {"email": "no-reply@circleci.com"},
+                "subject": "CircleCI Build Report - QR-code",
+                "content": [
+                  {"type": "text/plain", "value": "Build completed. Check artifacts for Dependency-Check, SonarQube, and Unit Test reports: https://circleci.com/gh/aathawerani/Utilitites/${CIRCLE_BUILD_NUM}"}
+                ]
+              }'
+
+# Define workflow
+workflows:
+  build-test-deploy:
+    jobs:
+      - checkout-and-build
+      - dependency-check:
+          requires:
+            - checkout-and-build
+      - sonar-analysis:
+          requires:
+            - checkout-and-build
+      - unit-tests:
+          requires:
+            - checkout-and-build
+      - build-and-push-docker:
+          requires:
+            - dependency-check
+            - sonar-analysis
+            - unit-tests
+      - notify:
+          requires:
+            - dependency-check
+            - sonar-analysis
+            - unit-tests
